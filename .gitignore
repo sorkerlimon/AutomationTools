@@ -1,0 +1,44 @@
+# Executables
+*.exe
+
+# Build output
+dist/
+build/
+
+# Virtual environment
+env/
+venv/
+
+# Local docs
+docs/
+
+# Secrets
+config.py
+**/config.py
+!**/config.example.py
+
+# Runtime output
+log.txt
+found.txt
+mobile_verify.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Root copies (source is in chime/)
+/main.py
+/chime_checker.spec
+/requirements.txt
+/config.py
+/email.txt
+/found.txt
+/log.txt
